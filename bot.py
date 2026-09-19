@@ -64,9 +64,11 @@ from aiogram.types import (
     Message,
 )
 
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA")
-ADMIN_ID: int = int(os.getenv("ADMIN_ID", "5341904332"))
-DEFAULT_TIMEZONE_STR: str = os.getenv("BOT_TZ", "Europe/Moscow")
+# Токен и ID администратора прописаны напрямую без использования os.getenv(),
+# что предотвращает сбой TokenValidationError при наличии пустых системных переменных
+BOT_TOKEN: str = "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA".strip().replace(" ", "").replace("\n", "").replace("\r", "").strip("\"'")
+ADMIN_ID: int = 5341904332
+DEFAULT_TIMEZONE_STR: str = "Europe/Moscow"
 UPDATE_INTERVAL_SECONDS: int = 4
 
 logging.basicConfig(
