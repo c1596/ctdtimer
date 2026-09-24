@@ -3,14 +3,14 @@ import importlib.util
 import subprocess
 import sys
 
-# Список необходимых внешних библиотек
+# Список необходимых внешних библиотек для автоматической установки
 REQUIRED_DEPENDENCIES = {
     "aiogram": "aiogram>=3.13.0",
     "pytz": "pytz>=2024.1",
 }
 
 def auto_install_dependencies() -> None:
-    """Проверяет и автоматически устанавливает зависимости при первом запуске."""
+    """Проверяет наличие требуемых библиотек и автоматически устанавливает их через pip."""
     missing_packages = []
     for module_name, pip_package in REQUIRED_DEPENDENCIES.items():
         if importlib.util.find_spec(module_name) is None:
@@ -32,11 +32,12 @@ def auto_install_dependencies() -> None:
                 stderr=sys.stderr,
             )
             importlib.invalidate_caches()
-            print("✅ Зависимости успешно установлены!\n")
+            print("✅ Все библиотеки успешно установлены!\n")
         except subprocess.CalledProcessError as err:
             print(f"❌ Ошибка установки зависимостей: {err}", file=sys.stderr)
             sys.exit(1)
 
+# Автоматический запуск проверки перед импортом сторонних библиотек
 auto_install_dependencies()
 
 import asyncio
@@ -69,15 +70,19 @@ from aiogram.types import (
     Message,
 )
 
-FALLBACK_BOT_TOKEN: str = "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA"
-FALLBACK_ADMIN_ID: int = 5341904332
+# Токен бота прописан напрямую в открытом виде без скрытия
+BOT_TOKEN: str = "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA"
+ADMIN_ID: int = 5341904332
 
-raw_env_token = os.getenv("BOT_TOKEN", "").strip().strip("\"'")
-BOT_TOKEN: str = raw_env_token if raw_env_token else FALLBACK_BOT_TOKEN
-BOT_TOKEN = BOT_TOKEN.replace(" ", "").replace("\n", "").replace("\r", "").strip("\"'")
+# Дополнительная защита: если в среде контейнера задан BOT_TOKEN, проверяем его валидность.
+# Если переменная окружения пустая или некорректная, жестко используем указанный выше токен.
+raw_env_token = os.getenv("BOT_TOKEN", "").strip().replace(" ", "").replace('"', '').replace("'", "")
+if ":" in raw_env_token:
+    token_parts = raw_env_token.split(":", 1)
+    if token_parts[0].isdigit() and len(token_parts[1]) >= 10:
+        BOT_TOKEN = raw_env_token
 
-raw_admin_env = os.getenv("ADMIN_ID", "").strip()
-ADMIN_ID: int = int(raw_admin_env) if (raw_admin_env.isdigit() or (raw_admin_env.startswith("-") and raw_admin_env[1:].isdigit())) else FALLBACK_ADMIN_ID
+BOT_TOKEN = BOT_TOKEN.strip().replace(" ", "").replace("\n", "").replace("\r", "").replace('"', '').replace("'", "")
 
 DEFAULT_TIMEZONE_STR: str = "Europe/Moscow"
 
@@ -105,13 +110,13 @@ PROGRESS_BAR_STYLES = {
 
 class CountdownFSM(StatesGroup):
     waiting_title = State()          # 1. Название события
-    waiting_datetime = State()       # 2. Дата / время
-    waiting_style = State()          # 2.1 Выбор визуала шкалы
-    waiting_destination = State()    # 3. Место публикации (ЛС или Канал)
-    waiting_channel_target = State() # 3.1 Ввод канала
-    waiting_photo = State()          # 4. Фото-обложка
-    waiting_finish_text = State()    # 5. Финальное сообщение
-    waiting_confirm = State()        # 6. Предпросмотр и запуск
+    waiting_datetime = State()       # 2. Дата / время финиша
+    waiting_style = State()          # 3. Визуальный стиль шкалы
+    waiting_destination = State()    # 4. Место публикации (ЛС или Канал)
+    waiting_channel_target = State() # 4.1 Ввод канала
+    waiting_photo = State()          # 5. Фото-обложка
+    waiting_finish_text = State()    # 6. Финальное сообщение
+    waiting_confirm = State()        # 7. Предпросмотр и запуск
 
 def generate_progress_bar(
     total_duration: float,
@@ -119,7 +124,7 @@ def generate_progress_bar(
     length: int = 10,
     style_key: str = "classic",
 ) -> Tuple[str, float]:
-    """Формирует шкалу прогресса на основе выбранного стиля."""
+    """Формирует шкалу прогресса на основе выбранного визуального стиля."""
     fill_char, empty_char, _ = PROGRESS_BAR_STYLES.get(style_key, PROGRESS_BAR_STYLES["classic"])
 
     if total_duration <= 0:
@@ -135,7 +140,7 @@ def generate_progress_bar(
     return bar_str, percent
 
 def format_countdown_badge(remaining_seconds: int) -> str:
-    """Форматирует оставшееся время в компактный моноширинный вид."""
+    """Форматирует оставшееся время в компактный моноширинный бейдж."""
     if remaining_seconds <= 0:
         return "00:00:00"
 
@@ -158,8 +163,8 @@ def render_timer_card(
     finish_message: Optional[str] = None,
 ) -> str:
     """
-    Генерирует строго компактный пост таймера:
-    Содержит исключительно:
+    Генерирует ультракомпактный пост таймера.
+    Содержит строго:
     1. Событие
     2. Цель
     3. Шкала завершения
@@ -193,6 +198,7 @@ def render_timer_card(
     )
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
+    """Главная клавиатура бота."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⚡ Создать живой таймер", callback_data="wizard_start")],
@@ -241,6 +247,7 @@ def get_style_selection_keyboard(current_style: str = "classic") -> InlineKeyboa
     return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 def get_destination_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура выбора места трансляции таймера."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -255,6 +262,7 @@ def get_destination_keyboard() -> InlineKeyboardMarkup:
     )
 
 def get_photo_step_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка пропуска прикрепления обложки."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="⏩ Без обложки (только текст)", callback_data="skip_photo_action")],
@@ -266,9 +274,10 @@ def get_photo_step_keyboard() -> InlineKeyboardMarkup:
     )
 
 def get_finish_text_keyboard() -> InlineKeyboardMarkup:
+    """Кнопка выбора стандартного текста поздравления."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏩ Стандартное («Событие наступило!»)", callback_data="default_finish_text")],
+            [InlineKeyboardButton(text="⏩ По умолчанию («Событие наступило!»)", callback_data="default_finish_text")],
             [
                 InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_photo"),
                 InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
@@ -277,6 +286,7 @@ def get_finish_text_keyboard() -> InlineKeyboardMarkup:
     )
 
 def get_confirmation_keyboard() -> InlineKeyboardMarkup:
+    """Клавиатура подтверждения запуска таймера."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🚀 Опубликовать и запустить", callback_data="confirm_launch_timer")],
@@ -288,6 +298,7 @@ def get_confirmation_keyboard() -> InlineKeyboardMarkup:
     )
 
 def get_timer_widget_keyboard(timer_key: str, can_stop: bool = True) -> Optional[InlineKeyboardMarkup]:
+    """Кнопка управления под виджетом таймера."""
     if not can_stop:
         return None
     return InlineKeyboardMarkup(
@@ -298,10 +309,10 @@ def get_timer_widget_keyboard(timer_key: str, can_stop: bool = True) -> Optional
 
 def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[datetime]:
     """
-    Умный парсер времени:
+    Умный парсер пользовательского ввода времени:
     - ДД.ММ.ГГГГ ЧЧ:ММ (31.12.2026 23:59)
     - ДД.ММ ЧЧ:ММ (31.12 23:59)
-    - ЧЧ:ММ (автоматически сегодня или завтра)
+    - ЧЧ:ММ (сегодня или завтра)
     - Относительный ввод: +45m, +2h, +3d
     """
     text = user_input.strip()
@@ -485,17 +496,18 @@ router = Router()
 
 @router.message(CommandStart())
 async def cmd_start(message: Message, state: FSMContext) -> None:
+    """Стартовое меню бота."""
     await state.clear()
     first_name = html.escape(message.from_user.first_name)
     text = (
         f"👋 <b>Привет, {first_name}!</b>\n\n"
-        f"Я создаю <b>живые динамические таймеры</b> для личных сообщений и каналов.\n\n"
-        f"✨ <b>Что внутри:</b>\n"
+        f"Я создаю <b>живые динамические таймеры</b> для личных сообщений и Telegram-каналов.\n\n"
+        f"✨ <b>Особенности:</b>\n"
         f"• <b>Компактный пост:</b> только Событие, Цель и Шкала завершения\n"
         f"• <b>Живой непрерывный отсчет:</b> обновление каждые <code>{int(LIVE_UPDATE_INTERVAL_SECONDS)} сек</code>\n"
         f"• <b>Стили прогресс-бара:</b> Классика, Неон, Изумруд, Квадраты, Точки\n"
         f"• <b>Поддержка фото:</b> посты с баннерами или лаконичные текстовые карточки\n"
-        f"• <b>Удобное управление:</b> моментальная отмена и просмотр таймеров\n\n"
+        f"• <b>Удобное управление:</b> моментальная отмена и просмотр всех таймеров\n\n"
         f"Нажмите кнопку ниже, чтобы запустить мастер создания!"
     )
     await message.answer(text, reply_markup=get_main_menu_keyboard())
@@ -503,6 +515,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
 @router.message(Command("cancel"))
 @router.callback_query(F.data == "cancel_wizard")
 async def cancel_wizard(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
+    """Отмена мастера создания таймера."""
     await state.clear()
     msg_text = "❌ <b>Создание таймера отменено.</b>"
     if isinstance(event, CallbackQuery):
@@ -513,6 +526,7 @@ async def cancel_wizard(event: Union[Message, CallbackQuery], state: FSMContext)
 
 @router.callback_query(F.data == "help_channel_info")
 async def help_channel(callback: CallbackQuery) -> None:
+    """Справка по подключению таймера в канал."""
     await callback.answer()
     text = (
         f"📢 <b>КАК ПОДКЛЮЧИТЬ ТАЙМЕР К ВАШЕМУ КАНАЛУ:</b>\n\n"
@@ -531,6 +545,7 @@ async def help_channel(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "back_to_main_menu")
 async def back_to_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    """Возврат в главное меню."""
     await callback.answer()
     await state.clear()
     await callback.message.edit_text("Главное меню управления таймерами:", reply_markup=get_main_menu_keyboard())
@@ -538,6 +553,7 @@ async def back_to_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
 @router.callback_query(F.data == "my_active_timers")
 @router.message(Command("timers"))
 async def show_active_timers(event: Union[Message, CallbackQuery]) -> None:
+    """Отображает список всех работающих таймеров пользователя."""
     user_id = event.from_user.id
     user_timers = [
         (k, v) for k, v in active_timers_registry.items()
@@ -586,9 +602,10 @@ async def show_active_timers(event: Union[Message, CallbackQuery]) -> None:
 @router.callback_query(F.data == "wizard_start")
 @router.message(Command("newtimer"))
 async def wizard_step_1_title(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
+    """Шаг 1: Запрос названия события."""
     await state.set_state(CountdownFSM.waiting_title)
     text = (
-        f"📝 <b>[●○○○○○] Шаг 1 из 6 • Название события</b>\n\n"
+        f"📝 <b>[●○○○○○○] Шаг 1 из 6 • Название события</b>\n\n"
         f"Введите название для карточки таймера (до 70 символов):\n"
         f"<i>Например: «Новый Год 2027 🍾» или «Запуск Проекта 🚀»</i>"
     )
@@ -607,6 +624,7 @@ async def back_to_title(callback: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(StateFilter(CountdownFSM.waiting_title), F.text)
 async def process_title(message: Message, state: FSMContext) -> None:
+    """Обработка названия и переход к выбору времени."""
     title = message.text.strip()
     if len(title) > 70:
         await message.answer("⚠️ Название слишком длинное. Введите текст до 70 символов:")
@@ -619,7 +637,7 @@ async def process_title(message: Message, state: FSMContext) -> None:
     sample_time = (datetime.now(tz) + timedelta(days=1, hours=3)).strftime("%d.%m.%Y %H:%M")
 
     text = (
-        f"📅 <b>[●●○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
+        f"📅 <b>[●●○○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
         f"Событие: <b>{html.escape(title)}</b>\n\n"
         f"Выберите быстрый интервал кнопкой или введите время вручную:\n"
         f"• <code>{sample_time}</code> (ДД.ММ.ГГГГ ЧЧ:ММ)\n"
@@ -630,6 +648,7 @@ async def process_title(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(StateFilter(CountdownFSM.waiting_datetime), F.data.startswith("dt_preset:"))
 async def process_datetime_preset(callback: CallbackQuery, state: FSMContext) -> None:
+    """Обработка быстрого клика по пресету времени."""
     preset = callback.data.split(":")[1]
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
     now = datetime.now(tz)
@@ -654,7 +673,7 @@ async def process_datetime_preset(callback: CallbackQuery, state: FSMContext) ->
     await callback.answer("Время выбрано!")
 
     await callback.message.edit_text(
-        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"🎨 <b>[●●●○○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
         f"Финиш: <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n\n"
         f"Выберите понравившийся вид полосы прогресса:",
         reply_markup=get_style_selection_keyboard("classic")
@@ -662,6 +681,7 @@ async def process_datetime_preset(callback: CallbackQuery, state: FSMContext) ->
 
 @router.message(StateFilter(CountdownFSM.waiting_datetime), F.text)
 async def process_datetime_text(message: Message, state: FSMContext) -> None:
+    """Обработка ручного ввода времени."""
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
     target_dt = parse_flexible_datetime(message.text, tz)
 
@@ -682,7 +702,7 @@ async def process_datetime_text(message: Message, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_style)
 
     await message.answer(
-        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"🎨 <b>[●●●○○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
         f"Финиш: <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n\n"
         f"Выберите стиль шкалы прогресса:",
         reply_markup=get_style_selection_keyboard("classic")
@@ -695,7 +715,7 @@ async def back_to_datetime(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_datetime)
     await callback.answer()
     await callback.message.edit_text(
-        f"📅 <b>[●●○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
+        f"📅 <b>[●●○○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
         f"Событие: <b>{html.escape(title)}</b>\n"
         f"Выберите кнопку или отправьте дату:",
         reply_markup=get_datetime_presets_keyboard()
@@ -713,7 +733,7 @@ async def continue_from_style_handler(callback: CallbackQuery, state: FSMContext
     await callback.answer()
     await state.set_state(CountdownFSM.waiting_destination)
     await callback.message.edit_text(
-        f"📍 <b>[●●●●○○] Шаг 4 из 6 • Место публикации</b>\n\n"
+        f"📍 <b>[●●●●○○○] Шаг 4 из 6 • Место публикации</b>\n\n"
         f"Куда вы хотите отправить живой виджет таймера?",
         reply_markup=get_destination_keyboard()
     )
@@ -725,7 +745,7 @@ async def back_to_style(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_style)
     await callback.answer()
     await callback.message.edit_text(
-        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"🎨 <b>[●●●○○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
         f"Выберите стиль шкалы прогресса:",
         reply_markup=get_style_selection_keyboard(current_style)
     )
@@ -736,7 +756,7 @@ async def choose_dest_private(callback: CallbackQuery, state: FSMContext) -> Non
     await state.update_data(target_chat_id=callback.message.chat.id, target_chat_name="Этот диалог (ЛС)")
     await state.set_state(CountdownFSM.waiting_photo)
     await callback.message.edit_text(
-        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n\n"
+        f"🖼 <b>[●●●●●○○] Шаг 5 из 6 • Обложка / Баннер</b>\n\n"
         f"Отправьте фотографию для карточки события или нажмите «Без обложки»:",
         reply_markup=get_photo_step_keyboard()
     )
@@ -763,12 +783,13 @@ async def back_to_dest(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_destination)
     await callback.answer()
     await callback.message.edit_text(
-        "📍 <b>[●●●●○○] Шаг 4 из 6 • Место публикации</b>\nКуда отправить живой таймер?",
+        "📍 <b>[●●●●○○○] Шаг 4 из 6 • Место публикации</b>\nКуда отправить живой таймер?",
         reply_markup=get_destination_keyboard()
     )
 
 @router.message(StateFilter(CountdownFSM.waiting_channel_target))
 async def process_channel_target(message: Message, state: FSMContext, bot: Bot) -> None:
+    """Проверка прав бота в указанном Telegram-канале."""
     chat_identifier: Union[int, str]
 
     if message.forward_from_chat:
@@ -804,7 +825,7 @@ async def process_channel_target(message: Message, state: FSMContext, bot: Bot) 
 
     await message.answer(
         f"✅ Канал <b>«{html.escape(target_title)}»</b> успешно подключен!\n\n"
-        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
+        f"🖼 <b>[●●●●●○○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
         f"Отправьте фотографию или пропустите шаг:",
         reply_markup=get_photo_step_keyboard()
     )
@@ -816,7 +837,7 @@ async def process_photo_upload(message: Message, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_finish_text)
     await message.answer(
         f"🖼 Обложка сохранена!\n\n"
-        f"🎉 <b>[●●●●●●] Шаг 6 из 6 • Финальное послание</b>\n"
+        f"🎉 <b>[●●●●●●○] Шаг 6 из 6 • Финальное послание</b>\n"
         f"Введите текст, который появится в карточке и уведомлении при 00:00:00:",
         reply_markup=get_finish_text_keyboard()
     )
@@ -827,7 +848,7 @@ async def process_photo_skipped(callback: CallbackQuery, state: FSMContext) -> N
     await state.update_data(photo_id=None)
     await state.set_state(CountdownFSM.waiting_finish_text)
     await callback.message.edit_text(
-        f"🎉 <b>[●●●●●●] Шаг 6 из 6 • Финальное послание</b>\n\n"
+        f"🎉 <b>[●●●●●●○] Шаг 6 из 6 • Финальное послание</b>\n\n"
         f"Введите текст поздравления/завершения или нажмите кнопку по умолчанию:",
         reply_markup=get_finish_text_keyboard()
     )
@@ -837,7 +858,7 @@ async def back_to_photo(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_photo)
     await callback.answer()
     await callback.message.edit_text(
-        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
+        f"🖼 <b>[●●●●●○○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
         f"Отправьте фото или продолжите без него:",
         reply_markup=get_photo_step_keyboard()
     )
@@ -854,6 +875,7 @@ async def finish_text_custom(message: Message, state: FSMContext) -> None:
     await show_confirmation_preview(message, state)
 
 async def show_confirmation_preview(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
+    """Отображение экрана предпросмотра перед фактическим стартом воркера."""
     await state.set_state(CountdownFSM.waiting_confirm)
     data = await state.get_data()
 
@@ -876,7 +898,7 @@ async def show_confirmation_preview(event: Union[Message, CallbackQuery], state:
         f"🖼 <b>Обложка:</b> {'Прикреплена' if has_photo else 'Без фото'}\n"
         f"💬 <b>Финал:</b> <i>«{html.escape(finish_text)}»</i>\n"
         f"─────────────────────────────\n"
-        f"⚡ <i>Отсчет будет идти непрерывно каждые {int(LIVE_UPDATE_INTERVAL_SECONDS)} секунды.</i>"
+        f"⚡ <i>Отсчет будет обновляться непрерывно каждые {int(LIVE_UPDATE_INTERVAL_SECONDS)} сек.</i>"
     )
 
     if isinstance(event, CallbackQuery):
