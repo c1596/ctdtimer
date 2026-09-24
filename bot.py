@@ -1,3 +1,4 @@
+import importlib
 import importlib.util
 import subprocess
 import sys
@@ -19,10 +20,18 @@ def auto_install_dependencies() -> None:
         print(f"🔧 Установка недостающих пакетов: {', '.join(missing_packages)}")
         try:
             subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", *missing_packages],
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--no-warn-script-location",
+                    *missing_packages,
+                ],
                 stdout=sys.stdout,
                 stderr=sys.stderr,
             )
+            importlib.invalidate_caches()
             print("✅ Зависимости успешно установлены!\n")
         except subprocess.CalledProcessError as err:
             print(f"❌ Ошибка установки зависимостей: {err}", file=sys.stderr)
@@ -60,12 +69,19 @@ from aiogram.types import (
     Message,
 )
 
-# Конфигурация запуска
-BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA").strip().strip("\"'")
-ADMIN_ID: int = int(os.getenv("ADMIN_ID", "5341904332"))
+FALLBACK_BOT_TOKEN: str = "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA"
+FALLBACK_ADMIN_ID: int = 5341904332
+
+raw_env_token = os.getenv("BOT_TOKEN", "").strip().strip("\"'")
+BOT_TOKEN: str = raw_env_token if raw_env_token else FALLBACK_BOT_TOKEN
+BOT_TOKEN = BOT_TOKEN.replace(" ", "").replace("\n", "").replace("\r", "").strip("\"'")
+
+raw_admin_env = os.getenv("ADMIN_ID", "").strip()
+ADMIN_ID: int = int(raw_admin_env) if (raw_admin_env.isdigit() or (raw_admin_env.startswith("-") and raw_admin_env[1:].isdigit())) else FALLBACK_ADMIN_ID
+
 DEFAULT_TIMEZONE_STR: str = "Europe/Moscow"
 
-# Постоянный фиксированный интервал живого обновления (без замедлений и адаптивных задержек)
+# Непрерывный живой интервал отсчета (без адаптивных замедлений и искусственных задержек)
 LIVE_UPDATE_INTERVAL_SECONDS: float = 3.0
 
 logging.basicConfig(
@@ -75,27 +91,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CountdownBot")
 
-# Глобальные реестры активных задач и метаданных
+# Глобальные хранилища задач и состояния
 active_tasks: Dict[str, asyncio.Task] = {}
 active_timers_registry: Dict[str, Dict[str, Any]] = {}
 
-# Доступные стили шкалы завершения
 PROGRESS_BAR_STYLES = {
     "classic": ("█", "░", "Классика [████░░░░]"),
     "neon": ("▰", "▱", "Неон [▰▰▰▱▱▱]"),
     "emerald": ("🟩", "⬜", "Изумруд [🟩🟩⬜⬜]"),
     "squares": ("■", "□", "Квадраты [■■■□□□]"),
+    "dots": ("●", "○", "Точки [●●●○○○]"),
 }
 
 class CountdownFSM(StatesGroup):
     waiting_title = State()          # 1. Название события
     waiting_datetime = State()       # 2. Дата / время
     waiting_style = State()          # 2.1 Выбор визуала шкалы
-    waiting_destination = State()    # 3. Место (ЛС или Канал)
+    waiting_destination = State()    # 3. Место публикации (ЛС или Канал)
     waiting_channel_target = State() # 3.1 Ввод канала
-    waiting_photo = State()          # 4. Обложка
-    waiting_finish_text = State()    # 5. Финальный текст
-    waiting_confirm = State()        # 6. Предпросмотр и подтверждение
+    waiting_photo = State()          # 4. Фото-обложка
+    waiting_finish_text = State()    # 5. Финальное сообщение
+    waiting_confirm = State()        # 6. Предпросмотр и запуск
 
 def generate_progress_bar(
     total_duration: float,
@@ -212,7 +228,7 @@ def get_datetime_presets_keyboard() -> InlineKeyboardMarkup:
     )
 
 def get_style_selection_keyboard(current_style: str = "classic") -> InlineKeyboardMarkup:
-    """Выбор визуального стиля шкалы прогресса."""
+    """Клавиатура выбора визуального стиля шкалы."""
     buttons = []
     for key, (_, _, label) in PROGRESS_BAR_STYLES.items():
         mark = "✓ " if key == current_style else ""
@@ -285,13 +301,12 @@ def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[da
     Умный парсер времени:
     - ДД.ММ.ГГГГ ЧЧ:ММ (31.12.2026 23:59)
     - ДД.ММ ЧЧ:ММ (31.12 23:59)
-    - ЧЧ:ММ (например, 18:30 — автоматически выбирает сегодня или завтра)
+    - ЧЧ:ММ (автоматически сегодня или завтра)
     - Относительный ввод: +45m, +2h, +3d
     """
     text = user_input.strip()
     now = datetime.now(tz)
 
-    # Относительный формат: +Xm, +Xh, +Xd
     rel_match = re.fullmatch(r"\+(\d+)\s*([mмhчdд])", text, re.IGNORECASE)
     if rel_match:
         val = int(rel_match.group(1))
@@ -303,7 +318,6 @@ def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[da
         elif unit in ("d", "д"):
             return now + timedelta(days=val)
 
-    # Формат ЧЧ:ММ
     time_match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
     if time_match:
         hour, minute = int(time_match.group(1)), int(time_match.group(2))
@@ -313,7 +327,6 @@ def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[da
                 target += timedelta(days=1)
             return target
 
-    # Формат ДД.ММ ЧЧ:ММ
     short_dt_match = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})", text)
     if short_dt_match:
         day = int(short_dt_match.group(1))
@@ -328,7 +341,6 @@ def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[da
         except ValueError:
             return None
 
-    # Формат ДД.ММ.ГГГГ ЧЧ:ММ
     try:
         naive = datetime.strptime(text, "%d.%m.%Y %H:%M")
         return tz.localize(naive)
@@ -351,7 +363,7 @@ async def run_live_timer_worker(
     """
     Непрерывный живой воркер:
     - Обновляется строго с постоянным интервалом LIVE_UPDATE_INTERVAL_SECONDS.
-    - Никакого адаптивного снижения частоты или искусственных задержек.
+    - Никакого адаптивного замедления частоты.
     """
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
     last_rendered_payload = ""
@@ -361,7 +373,6 @@ async def run_live_timer_worker(
             now = datetime.now(tz)
             remaining_seconds = (target_dt - now).total_seconds()
 
-            # ФИНИШ: время истекло
             if remaining_seconds <= 0:
                 final_card = render_timer_card(
                     title=title,
@@ -389,7 +400,6 @@ async def run_live_timer_worker(
                             reply_markup=None,
                         )
 
-                    # Торжественное звуковое оповещение в чат/канал
                     await bot.send_message(
                         chat_id=target_chat_id,
                         text=(
@@ -400,7 +410,6 @@ async def run_live_timer_worker(
                         disable_notification=False,
                     )
 
-                    # Персональное уведомление создателю, если таймер был в канале
                     if str(target_chat_id) != str(creator_user_id):
                         await bot.send_message(
                             chat_id=creator_user_id,
@@ -413,7 +422,6 @@ async def run_live_timer_worker(
                     logger.error(f"Ошибка финализации таймера ({target_chat_id}): {finish_err}")
                 break
 
-            # Отрисовка текущего кадра
             current_card = render_timer_card(
                 title=title,
                 target_dt=target_dt,
@@ -453,7 +461,7 @@ async def run_live_timer_worker(
                     if "message is not modified" in err_text:
                         pass
                     elif "message to edit not found" in err_text or "message can't be edited" in err_text:
-                        logger.info(f"Сообщение {message_id} было удалено. Остановка воркера.")
+                        logger.info(f"Сообщение {message_id} удалено. Остановка воркера.")
                         break
                     else:
                         logger.warning(f"TelegramBadRequest ({target_chat_id}): {bad_req}")
@@ -465,7 +473,6 @@ async def run_live_timer_worker(
                 except Exception as unexpected:
                     logger.error(f"Ошибка воркера: {unexpected}")
 
-            # Чистый постоянный интервал живого обновления
             await asyncio.sleep(LIVE_UPDATE_INTERVAL_SECONDS)
 
     except asyncio.CancelledError:
@@ -486,9 +493,9 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
         f"✨ <b>Что внутри:</b>\n"
         f"• <b>Компактный пост:</b> только Событие, Цель и Шкала завершения\n"
         f"• <b>Живой непрерывный отсчет:</b> обновление каждые <code>{int(LIVE_UPDATE_INTERVAL_SECONDS)} сек</code>\n"
-        f"• <b>Стили прогресс-бара:</b> Классика, Неон, Изумруд, Квадраты\n"
-        f"• <b>Поддержка фото:</b> карточки с баннерами или лаконичные текстовые посты\n"
-        f"• <b>Удобное управление:</b> моментальная отмена и мониторинг активных таймеров\n\n"
+        f"• <b>Стили прогресс-бара:</b> Классика, Неон, Изумруд, Квадраты, Точки\n"
+        f"• <b>Поддержка фото:</b> посты с баннерами или лаконичные текстовые карточки\n"
+        f"• <b>Удобное управление:</b> моментальная отмена и просмотр таймеров\n\n"
         f"Нажмите кнопку ниже, чтобы запустить мастер создания!"
     )
     await message.answer(text, reply_markup=get_main_menu_keyboard())
@@ -905,7 +912,6 @@ async def confirm_launch_timer(callback: CallbackQuery, state: FSMContext, bot: 
 
     is_private_chat = (str(target_chat_id) == str(callback.message.chat.id))
 
-    # Публикация карточки
     try:
         if photo_id:
             sent_msg = await bot.send_photo(
@@ -921,14 +927,13 @@ async def confirm_launch_timer(callback: CallbackQuery, state: FSMContext, bot: 
     except Exception as err:
         await callback.message.edit_text(
             f"❌ <b>Ошибка отправки сообщения:</b>\n<code>{html.escape(str(err))}</code>\n\n"
-            f"Убедитесь, что у бота есть права на публикацию.",
+            f"Убедитесь, что у бота есть права на публикацию в чате/канале.",
             reply_markup=get_main_menu_keyboard()
         )
         return
 
     timer_key = f"{target_chat_id}_{sent_msg.message_id}"
 
-    # Если в ЛС — сразу ставим кнопку остановки
     if is_private_chat:
         try:
             kb = get_timer_widget_keyboard(timer_key=timer_key, can_stop=True)
@@ -949,7 +954,6 @@ async def confirm_launch_timer(callback: CallbackQuery, state: FSMContext, bot: 
         except Exception:
             pass
 
-    # Регистрация в реестре
     active_timers_registry[timer_key] = {
         "title": title,
         "target_dt": target_dt,
@@ -958,7 +962,6 @@ async def confirm_launch_timer(callback: CallbackQuery, state: FSMContext, bot: 
         "creator_id": callback.from_user.id,
     }
 
-    # Запуск живого воркера
     worker_task = asyncio.create_task(
         run_live_timer_worker(
             bot=bot,
