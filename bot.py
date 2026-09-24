@@ -9,39 +9,34 @@ REQUIRED_DEPENDENCIES = {
 }
 
 def auto_install_dependencies() -> None:
-    """
-    Проверяет наличие требуемых библиотек и автоматически
-    устанавливает их через pip, если они отсутствуют в системе.
-    """
+    """Проверяет и автоматически устанавливает зависимости при первом запуске."""
     missing_packages = []
     for module_name, pip_package in REQUIRED_DEPENDENCIES.items():
         if importlib.util.find_spec(module_name) is None:
             missing_packages.append(pip_package)
 
     if missing_packages:
-        print(f"🔧 Обнаружены неустановленные зависимости: {', '.join(missing_packages)}")
-        print("⏳ Запуск автоматической установки через pip...")
+        print(f"🔧 Установка недостающих пакетов: {', '.join(missing_packages)}")
         try:
             subprocess.check_call(
                 [sys.executable, "-m", "pip", "install", *missing_packages],
                 stdout=sys.stdout,
                 stderr=sys.stderr,
             )
-            print("✅ Все библиотеки успешно установлены!\n")
+            print("✅ Зависимости успешно установлены!\n")
         except subprocess.CalledProcessError as err:
-            print(f"❌ Не удалось автоматически установить библиотеки: {err}", file=sys.stderr)
-            print("Пожалуйста, выполните команду вручную: pip install " + " ".join(missing_packages), file=sys.stderr)
+            print(f"❌ Ошибка установки зависимостей: {err}", file=sys.stderr)
             sys.exit(1)
 
-# Автоматическая инсталляция до импорта сторонних пакетов
 auto_install_dependencies()
 
 import asyncio
 import html
 import logging
 import os
+import re
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional, Set, Union
+from typing import Any, Dict, Optional, Tuple, Union
 
 import pytz
 from aiogram import Bot, Dispatcher, F, Router
@@ -58,18 +53,20 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
+    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
 )
 
-# Токен и ID администратора прописаны напрямую без использования os.getenv(),
-# что предотвращает сбой TokenValidationError при наличии пустых системных переменных
-BOT_TOKEN: str = "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA".strip().replace(" ", "").replace("\n", "").replace("\r", "").strip("\"'")
-ADMIN_ID: int = 5341904332
+# Конфигурация запуска
+BOT_TOKEN: str = os.getenv("BOT_TOKEN", "8986545593:AAGsw08a8eY182N4LKIrAXKJeh3iVwmx5FA").strip().strip("\"'")
+ADMIN_ID: int = int(os.getenv("ADMIN_ID", "5341904332"))
 DEFAULT_TIMEZONE_STR: str = "Europe/Moscow"
-UPDATE_INTERVAL_SECONDS: int = 4
+
+# Постоянный фиксированный интервал живого обновления (без замедлений и адаптивных задержек)
+LIVE_UPDATE_INTERVAL_SECONDS: float = 3.0
 
 logging.basicConfig(
     level=logging.INFO,
@@ -78,41 +75,53 @@ logging.basicConfig(
 )
 logger = logging.getLogger("CountdownBot")
 
-# Множество для сохранения сильных ссылок на активные таски (защита от сборщика мусора GC)
-active_tasks: Set[asyncio.Task] = set()
+# Глобальные реестры активных задач и метаданных
+active_tasks: Dict[str, asyncio.Task] = {}
+active_timers_registry: Dict[str, Dict[str, Any]] = {}
+
+# Доступные стили шкалы завершения
+PROGRESS_BAR_STYLES = {
+    "classic": ("█", "░", "Классика [████░░░░]"),
+    "neon": ("▰", "▱", "Неон [▰▰▰▱▱▱]"),
+    "emerald": ("🟩", "⬜", "Изумруд [🟩🟩⬜⬜]"),
+    "squares": ("■", "□", "Квадраты [■■■□□□]"),
+}
 
 class CountdownFSM(StatesGroup):
-    """Машина состояний для комфортного пошагового создания таймера."""
-    waiting_title = State()          # Шаг 1: Название события
-    waiting_datetime = State()       # Шаг 2: Дата и время
-    waiting_destination = State()    # Шаг 3: Выбор: ЛС или Канал
-    waiting_channel_target = State() # Шаг 3.1: Юзернейм/ID канала при выборе канала
-    waiting_photo = State()          # Шаг 4: Изображение / обложка
-    waiting_finish_text = State()    # Шаг 5: Финальный текст после 00:00:00
+    waiting_title = State()          # 1. Название события
+    waiting_datetime = State()       # 2. Дата / время
+    waiting_style = State()          # 2.1 Выбор визуала шкалы
+    waiting_destination = State()    # 3. Место (ЛС или Канал)
+    waiting_channel_target = State() # 3.1 Ввод канала
+    waiting_photo = State()          # 4. Обложка
+    waiting_finish_text = State()    # 5. Финальный текст
+    waiting_confirm = State()        # 6. Предпросмотр и подтверждение
 
-def generate_smooth_progress_bar(total_duration: float, remaining: float, length: int = 12) -> tuple[str, float]:
-    """
-    Формирует монолитный эстетичный прогресс-бар:
-    Пример: [████████░░░░] 66.7%
-    """
+def generate_progress_bar(
+    total_duration: float,
+    remaining: float,
+    length: int = 10,
+    style_key: str = "classic",
+) -> Tuple[str, float]:
+    """Формирует шкалу прогресса на основе выбранного стиля."""
+    fill_char, empty_char, _ = PROGRESS_BAR_STYLES.get(style_key, PROGRESS_BAR_STYLES["classic"])
+
     if total_duration <= 0:
-        return "█" * length, 100.0
+        return fill_char * length, 100.0
 
     elapsed = max(0.0, total_duration - remaining)
     fraction = max(0.0, min(1.0, elapsed / total_duration))
     percent = fraction * 100.0
 
-    filled_blocks = int(round(length * fraction))
-    filled_blocks = max(0, min(length, filled_blocks))
-    empty_blocks = length - filled_blocks
-
-    bar_str = "█" * filled_blocks + "░" * empty_blocks
+    filled = int(round(length * fraction))
+    filled = max(0, min(length, filled))
+    bar_str = (fill_char * filled) + (empty_char * (length - filled))
     return bar_str, percent
 
 def format_countdown_badge(remaining_seconds: int) -> str:
-    """Форматирует остаток времени в аккуратный бейдж с выравниванием."""
+    """Форматирует оставшееся время в компактный моноширинный вид."""
     if remaining_seconds <= 0:
-        return "🏁  00:00:00  •  ФИНИШ!"
+        return "00:00:00"
 
     days = remaining_seconds // 86400
     hours = (remaining_seconds % 86400) // 3600
@@ -120,79 +129,102 @@ def format_countdown_badge(remaining_seconds: int) -> str:
     seconds = remaining_seconds % 60
 
     if days > 0:
-        return f"⏳  {days:02d} дн.  {hours:02d}:{minutes:02d}:{seconds:02d}"
-    return f"⏳  {hours:02d}:{minutes:02d}:{seconds:02d}"
+        return f"{days}д {hours:02d}:{minutes:02d}:{seconds:02d}"
+    return f"{hours:02d}:{minutes:02d}:{seconds:02d}"
 
 def render_timer_card(
     title: str,
     target_dt: datetime,
     total_seconds: float,
     remaining_seconds: float,
+    style_key: str = "classic",
     is_finished: bool = False,
     finish_message: Optional[str] = None,
 ) -> str:
     """
-    Генерирует премиальное визуальное сообщение со стильными разделителями,
-    моноширинным блоком и статус-баром.
+    Генерирует строго компактный пост таймера:
+    Содержит исключительно:
+    1. Событие
+    2. Цель
+    3. Шкала завершения
+    Никакого лишнего текста про автоматическое обновление!
     """
     safe_title = html.escape(title)
     date_str = target_dt.strftime("%d.%m.%Y в %H:%M")
 
     if is_finished:
         safe_finish = html.escape(finish_message or "Событие наступило!")
+        full_bar, _ = generate_progress_bar(1, 0, length=10, style_key=style_key)
         return (
-            f"🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━ 🎉\n"
-            f"🏆 <b>СОБЫТИЕ НАСТУПИЛО!</b>\n"
-            f"🎉 ━━━━━━━━━━━━━━━━━━━━━━━━━ 🎉\n\n"
-            f"📌 <b>Событие:</b> <b>{safe_title}</b>\n"
-            f"🎯 <b>Финишная дата:</b> <code>{date_str} (МСК)</code>\n\n"
-            f"<code>┌──────────────────────────────┐\n"
-            f"│  🏁  00:00:00  •  ФИНИШ!     │\n"
-            f"└──────────────────────────────┘</code>\n"
-            f"<code>[████████████] 100.0%</code>\n\n"
-            f"<blockquote>💬 <b>Финальное послание:</b>\n"
-            f"<i>{safe_finish}</i></blockquote>"
+            f"🎉 <b>Событие:</b> <b>{safe_title}</b>\n"
+            f"🎯 <b>Цель:</b> <code>{date_str} МСК</code>\n"
+            f"📊 <b>Шкала завершения:</b> <code>[{full_bar}] 100%</code> (🏁 <code>00:00:00</code>)\n\n"
+            f"<blockquote>💬 <i>{safe_finish}</i></blockquote>"
         )
 
-    bar, percent = generate_smooth_progress_bar(total_seconds, remaining_seconds, length=12)
+    bar, percent = generate_progress_bar(
+        total_duration=total_seconds,
+        remaining=remaining_seconds,
+        length=10,
+        style_key=style_key,
+    )
     badge = format_countdown_badge(int(remaining_seconds))
 
     return (
-        f"◈ ━━━━━━━━━━━━━━━━━━━━━━━━━ ◈\n"
-        f"⏳ <b>ОБРАТНЫЙ ОТСЧЕТ В РЕАЛЬНОМ ВРЕМЕНИ</b>\n"
-        f"◈ ━━━━━━━━━━━━━━━━━━━━━━━━━ ◈\n\n"
         f"📌 <b>Событие:</b> <b>{safe_title}</b>\n"
-        f"🎯 <b>Цель:</b> <code>{date_str} (МСК)</code>\n\n"
-        f"⏱ <b>До наступления момента:</b>\n"
-        f"<code>┌──────────────────────────────┐\n"
-        f"│  {badge:<28}│\n"
-        f"└──────────────────────────────┘</code>\n\n"
-        f"📊 <b>Шкала завершения:</b>\n"
-        f"<code>[{bar}] {percent:>5.1f}%</code>\n\n"
-        f"<i>⚡ Обновляется автоматически каждые {UPDATE_INTERVAL_SECONDS} сек.</i>"
+        f"🎯 <b>Цель:</b> <code>{date_str} МСК</code>\n"
+        f"📊 <b>Шкала завершения:</b> <code>[{bar}] {percent:>4.1f}%</code> (⏳ <code>{badge}</code>)"
     )
 
 def get_main_menu_keyboard() -> InlineKeyboardMarkup:
-    """Главная клавиатура приветствия."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="⏱ Создать новый таймер",
-                    callback_data="start_fsm_wizard"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="📢 Инструкция по каналу",
-                    callback_data="help_channel_info"
-                )
-            ]
+            [InlineKeyboardButton(text="⚡ Создать живой таймер", callback_data="wizard_start")],
+            [InlineKeyboardButton(text="📋 Мои активные таймеры", callback_data="my_active_timers")],
+            [InlineKeyboardButton(text="📢 Инструкция для каналов", callback_data="help_channel_info")],
         ]
     )
 
+def get_datetime_presets_keyboard() -> InlineKeyboardMarkup:
+    """Быстрые пресеты времени для моментальной настройки."""
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="+5 мин", callback_data="dt_preset:5m"),
+                InlineKeyboardButton(text="+15 мин", callback_data="dt_preset:15m"),
+                InlineKeyboardButton(text="+30 мин", callback_data="dt_preset:30m"),
+            ],
+            [
+                InlineKeyboardButton(text="+1 час", callback_data="dt_preset:1h"),
+                InlineKeyboardButton(text="+3 часа", callback_data="dt_preset:3h"),
+                InlineKeyboardButton(text="+12 часов", callback_data="dt_preset:12h"),
+            ],
+            [
+                InlineKeyboardButton(text="+1 день", callback_data="dt_preset:1d"),
+                InlineKeyboardButton(text="+3 дня", callback_data="dt_preset:3d"),
+                InlineKeyboardButton(text="+7 дней", callback_data="dt_preset:7d"),
+            ],
+            [
+                InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_title"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
+            ],
+        ]
+    )
+
+def get_style_selection_keyboard(current_style: str = "classic") -> InlineKeyboardMarkup:
+    """Выбор визуального стиля шкалы прогресса."""
+    buttons = []
+    for key, (_, _, label) in PROGRESS_BAR_STYLES.items():
+        mark = "✓ " if key == current_style else ""
+        buttons.append([InlineKeyboardButton(text=f"{mark}{label}", callback_data=f"set_style:{key}")])
+
+    buttons.append([
+        InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_datetime"),
+        InlineKeyboardButton(text="Далее »", callback_data="wizard_continue_from_style"),
+    ])
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
 def get_destination_keyboard() -> InlineKeyboardMarkup:
-    """Клавиатура выбора места трансляции таймера."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -200,65 +232,143 @@ def get_destination_keyboard() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📢 В Telegram-канал", callback_data="dest_channel"),
             ],
             [
-                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")
-            ]
+                InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_style"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
+            ],
         ]
     )
 
-def get_skip_photo_keyboard() -> InlineKeyboardMarkup:
-    """Кнопка пропуска прикрепления обложки."""
+def get_photo_step_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="⏩ Без обложки (только текст)", callback_data="skip_photo_action")],
             [
-                InlineKeyboardButton(text="⏩ Без обложки (только текст)", callback_data="skip_photo_action")
+                InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_dest"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
             ],
-            [
-                InlineKeyboardButton(text="❌ Отменить создание", callback_data="cancel_wizard")
-            ]
         ]
     )
 
-def get_timer_widget_keyboard(can_stop: bool = True) -> InlineKeyboardMarkup:
-    """Инлайн-кнопки под живым таймером."""
-    buttons = []
-    if can_stop:
-        buttons.append([InlineKeyboardButton(text="🛑 Остановить отсчет", callback_data="stop_active_timer")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+def get_finish_text_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="⏩ Стандартное («Событие наступило!»)", callback_data="default_finish_text")],
+            [
+                InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_photo"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
+            ],
+        ]
+    )
+
+def get_confirmation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚀 Опубликовать и запустить", callback_data="confirm_launch_timer")],
+            [
+                InlineKeyboardButton(text="✏️ Начать заново", callback_data="wizard_start"),
+                InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard"),
+            ],
+        ]
+    )
+
+def get_timer_widget_keyboard(timer_key: str, can_stop: bool = True) -> Optional[InlineKeyboardMarkup]:
+    if not can_stop:
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Остановить отсчет", callback_data=f"stop_timer:{timer_key}")]
+        ]
+    )
+
+def parse_flexible_datetime(user_input: str, tz: pytz.BaseTzInfo) -> Optional[datetime]:
+    """
+    Умный парсер времени:
+    - ДД.ММ.ГГГГ ЧЧ:ММ (31.12.2026 23:59)
+    - ДД.ММ ЧЧ:ММ (31.12 23:59)
+    - ЧЧ:ММ (например, 18:30 — автоматически выбирает сегодня или завтра)
+    - Относительный ввод: +45m, +2h, +3d
+    """
+    text = user_input.strip()
+    now = datetime.now(tz)
+
+    # Относительный формат: +Xm, +Xh, +Xd
+    rel_match = re.fullmatch(r"\+(\d+)\s*([mмhчdд])", text, re.IGNORECASE)
+    if rel_match:
+        val = int(rel_match.group(1))
+        unit = rel_match.group(2).lower()
+        if unit in ("m", "м"):
+            return now + timedelta(minutes=val)
+        elif unit in ("h", "ч"):
+            return now + timedelta(hours=val)
+        elif unit in ("d", "д"):
+            return now + timedelta(days=val)
+
+    # Формат ЧЧ:ММ
+    time_match = re.fullmatch(r"(\d{1,2}):(\d{2})", text)
+    if time_match:
+        hour, minute = int(time_match.group(1)), int(time_match.group(2))
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+            if target <= now:
+                target += timedelta(days=1)
+            return target
+
+    # Формат ДД.ММ ЧЧ:ММ
+    short_dt_match = re.fullmatch(r"(\d{1,2})\.(\d{1,2})\s+(\d{1,2}):(\d{2})", text)
+    if short_dt_match:
+        day = int(short_dt_match.group(1))
+        month = int(short_dt_match.group(2))
+        hour = int(short_dt_match.group(3))
+        minute = int(short_dt_match.group(4))
+        try:
+            target = tz.localize(datetime(now.year, month, day, hour, minute))
+            if target <= now:
+                target = tz.localize(datetime(now.year + 1, month, day, hour, minute))
+            return target
+        except ValueError:
+            return None
+
+    # Формат ДД.ММ.ГГГГ ЧЧ:ММ
+    try:
+        naive = datetime.strptime(text, "%d.%m.%Y %H:%M")
+        return tz.localize(naive)
+    except ValueError:
+        return None
 
 async def run_live_timer_worker(
     bot: Bot,
+    timer_key: str,
     target_chat_id: Union[int, str],
     message_id: int,
     title: str,
     target_dt: datetime,
     total_seconds: float,
+    style_key: str,
     finish_text: str,
     has_photo: bool,
     creator_user_id: int,
 ) -> None:
     """
-    Высоконадежный асинхронный воркер живого обновления таймера:
-    - Обновляет сообщение раз в 4 секунды
-    - Игнорирует TelegramBadRequest "message is not modified"
-    - Корректно ждет при TelegramRetryAfter (Flood Control)
-    - Завершается при удалении поста или блокировке бота
+    Непрерывный живой воркер:
+    - Обновляется строго с постоянным интервалом LIVE_UPDATE_INTERVAL_SECONDS.
+    - Никакого адаптивного снижения частоты или искусственных задержек.
     """
-    logger.info(f"Запущен воркер для чата {target_chat_id} (msg_id: {message_id})")
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
-    last_rendered_badge = ""
+    last_rendered_payload = ""
 
     try:
         while True:
             now = datetime.now(tz)
             remaining_seconds = (target_dt - now).total_seconds()
 
-            # Финальный рубеж: время истекло
+            # ФИНИШ: время истекло
             if remaining_seconds <= 0:
                 final_card = render_timer_card(
                     title=title,
                     target_dt=target_dt,
                     total_seconds=total_seconds,
                     remaining_seconds=0,
+                    style_key=style_key,
                     is_finished=True,
                     finish_message=finish_text,
                 )
@@ -279,368 +389,506 @@ async def run_live_timer_worker(
                             reply_markup=None,
                         )
 
-                    # Звуковое уведомление
+                    # Торжественное звуковое оповещение в чат/канал
                     await bot.send_message(
                         chat_id=target_chat_id,
                         text=(
-                            f"🔔 <b>ВНИМАНИЕ! СОБЫТИЕ НАСТУПИЛО!</b>\n\n"
-                            f"🎯 <b>{html.escape(title)}</b>\n"
-                            f"🎉 <i>{html.escape(finish_text)}</i>"
+                            f"🔔 <b>СОБЫТИЕ НАСТУПИЛО!</b>\n"
+                            f"🎯 <b>{html.escape(title)}</b>\n\n"
+                            f"<i>{html.escape(finish_text)}</i>"
                         ),
                         disable_notification=False,
                     )
 
-                    # Если таймер был в канале, сообщим создателю в ЛС
+                    # Персональное уведомление создателю, если таймер был в канале
                     if str(target_chat_id) != str(creator_user_id):
                         await bot.send_message(
                             chat_id=creator_user_id,
                             text=(
-                                f"✅ <b>Отсчет завершен!</b>\n\n"
-                                f"Событие «<b>{html.escape(title)}</b>» в канале <code>{target_chat_id}</code> "
-                                f"успешно подошло к концу!"
+                                f"✅ <b>Таймер завершен!</b>\n"
+                                f"Отсчет для события «<b>{html.escape(title)}</b>» в канале <code>{target_chat_id}</code> подошел к концу!"
                             ),
                         )
-                except Exception as exc:
-                    logger.error(f"Не удалось обновить финал для {target_chat_id}: {exc}")
-
+                except Exception as finish_err:
+                    logger.error(f"Ошибка финализации таймера ({target_chat_id}): {finish_err}")
                 break
 
-            current_badge = format_countdown_badge(int(remaining_seconds))
-            if current_badge != last_rendered_badge:
-                rendered_card = render_timer_card(
-                    title=title,
-                    target_dt=target_dt,
-                    total_seconds=total_seconds,
-                    remaining_seconds=remaining_seconds,
-                    is_finished=False,
-                )
+            # Отрисовка текущего кадра
+            current_card = render_timer_card(
+                title=title,
+                target_dt=target_dt,
+                total_seconds=total_seconds,
+                remaining_seconds=remaining_seconds,
+                style_key=style_key,
+                is_finished=False,
+            )
 
+            if current_card != last_rendered_payload:
                 try:
-                    kb = get_timer_widget_keyboard(can_stop=(str(target_chat_id) == str(creator_user_id)))
+                    can_stop = (str(target_chat_id) == str(creator_user_id))
+                    kb = get_timer_widget_keyboard(timer_key=timer_key, can_stop=can_stop)
+
                     if has_photo:
                         await bot.edit_message_caption(
                             chat_id=target_chat_id,
                             message_id=message_id,
-                            caption=rendered_card,
+                            caption=current_card,
                             reply_markup=kb,
                         )
                     else:
                         await bot.edit_message_text(
                             chat_id=target_chat_id,
                             message_id=message_id,
-                            text=rendered_card,
+                            text=current_card,
                             reply_markup=kb,
                         )
-                    last_rendered_badge = current_badge
+                    last_rendered_payload = current_card
 
                 except TelegramRetryAfter as retry_err:
-                    logger.warning(f"Flood control ({target_chat_id}): сон {retry_err.retry_after} сек.")
-                    await asyncio.sleep(retry_err.retry_after + 1)
+                    await asyncio.sleep(retry_err.retry_after + 0.5)
                     continue
 
                 except TelegramBadRequest as bad_req:
-                    err_msg = str(bad_req).lower()
-                    if "message is not modified" in err_msg:
+                    err_text = str(bad_req).lower()
+                    if "message is not modified" in err_text:
                         pass
-                    elif "message to edit not found" in err_msg or "message can't be edited" in err_msg:
-                        logger.info(f"Сообщение {message_id} удалено. Остановка таймера.")
+                    elif "message to edit not found" in err_text or "message can't be edited" in err_text:
+                        logger.info(f"Сообщение {message_id} было удалено. Остановка воркера.")
                         break
                     else:
                         logger.warning(f"TelegramBadRequest ({target_chat_id}): {bad_req}")
 
                 except (TelegramForbiddenError, TelegramNotFound):
-                    logger.warning(f"Бот заблокирован или исключен из {target_chat_id}. Завершение воркера.")
+                    logger.warning(f"Бот заблокирован или исключен из {target_chat_id}.")
                     break
 
-                except Exception as unexpected_err:
-                    logger.error(f"Ошибка цикла в {target_chat_id}: {unexpected_err}")
+                except Exception as unexpected:
+                    logger.error(f"Ошибка воркера: {unexpected}")
 
-            await asyncio.sleep(UPDATE_INTERVAL_SECONDS)
+            # Чистый постоянный интервал живого обновления
+            await asyncio.sleep(LIVE_UPDATE_INTERVAL_SECONDS)
 
     except asyncio.CancelledError:
-        logger.info(f"Воркер {target_chat_id}:{message_id} принудительно остановлен.")
+        logger.info(f"Воркер {timer_key} остановлен.")
     finally:
-        logger.info(f"Воркер {target_chat_id}:{message_id} финишировал.")
+        active_tasks.pop(timer_key, None)
+        active_timers_registry.pop(timer_key, None)
 
 router = Router()
 
 @router.message(CommandStart())
-async def cmd_start_handler(message: Message, state: FSMContext) -> None:
-    """Приветственное сообщение со стильным дизайном и быстрым доступом."""
+async def cmd_start(message: Message, state: FSMContext) -> None:
     await state.clear()
-    welcome_text = (
-        f"✨ <b>ПРИВЕТСТВУЮ, {html.escape(message.from_user.first_name).upper()}!</b> ✨\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Я — профессиональный бот <b>живого обратного отсчета</b>.\n\n"
-        f"🚀 <b>Главные фичи:</b>\n"
-        f"• <b>Живой таймер:</b> обновление каждые <code>{UPDATE_INTERVAL_SECONDS} секунды</code> без лагов\n"
-        f"• <b>Каналы и ЛС:</b> публикация в личные сообщения или в ваш Telegram-канал\n"
-        f"• <b>Стильный прогресс-бар:</b> аккуратная моноширинная шкала <code>[████░░░░]</code>\n"
-        f"• <b>Медиа-баннеры:</b> поддержка фотографий и постеров событий\n"
-        f"• <b>Финал:</b> победное сообщение и оповещение подписчиков в <code>00:00:00</code>\n\n"
-        f"Нажмите кнопку ниже, чтобы сконфигурировать ваш таймер!"
+    first_name = html.escape(message.from_user.first_name)
+    text = (
+        f"👋 <b>Привет, {first_name}!</b>\n\n"
+        f"Я создаю <b>живые динамические таймеры</b> для личных сообщений и каналов.\n\n"
+        f"✨ <b>Что внутри:</b>\n"
+        f"• <b>Компактный пост:</b> только Событие, Цель и Шкала завершения\n"
+        f"• <b>Живой непрерывный отсчет:</b> обновление каждые <code>{int(LIVE_UPDATE_INTERVAL_SECONDS)} сек</code>\n"
+        f"• <b>Стили прогресс-бара:</b> Классика, Неон, Изумруд, Квадраты\n"
+        f"• <b>Поддержка фото:</b> карточки с баннерами или лаконичные текстовые посты\n"
+        f"• <b>Удобное управление:</b> моментальная отмена и мониторинг активных таймеров\n\n"
+        f"Нажмите кнопку ниже, чтобы запустить мастер создания!"
     )
-    await message.answer(welcome_text, reply_markup=get_main_menu_keyboard())
+    await message.answer(text, reply_markup=get_main_menu_keyboard())
 
 @router.message(Command("cancel"))
 @router.callback_query(F.data == "cancel_wizard")
-async def cancel_wizard_handler(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
-    """Сброс мастера настройки."""
-    current_state = await state.get_state()
+async def cancel_wizard(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
     await state.clear()
-
-    text = "🛑 <b>Мастер создания таймера отменен.</b>\nВы можете начать заново в любой момент через /start или /newtimer."
+    msg_text = "❌ <b>Создание таймера отменено.</b>"
     if isinstance(event, CallbackQuery):
         await event.answer()
-        await event.message.edit_text(text)
+        await event.message.edit_text(msg_text, reply_markup=get_main_menu_keyboard())
     else:
-        await event.answer(text)
+        await event.answer(msg_text, reply_markup=get_main_menu_keyboard())
 
 @router.callback_query(F.data == "help_channel_info")
-async def channel_instructions_handler(callback: CallbackQuery) -> None:
-    """Инструкция по публикации в Telegram-канал."""
+async def help_channel(callback: CallbackQuery) -> None:
     await callback.answer()
-    help_text = (
-        f"📢 <b>КАК ЗАПУСТИТЬ ТАЙМЕР В СВОЕМ КАНАЛЕ?</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"1️⃣ Откройте настройки вашего канала.\n"
-        f"2️⃣ Добавьте этого бота в раздел <b>«Администраторы»</b>.\n"
-        f"3️⃣ Предоставьте боту права:\n"
-        f"   • <b>Публикация сообщений (Post Messages)</b>\n"
-        f"   • <b>Редактирование сообщений (Edit Messages)</b>\n"
-        f"4️⃣ Нажмите <b>«Создать новый таймер»</b> и выберите вариант <b>«В Telegram-канал»</b>.\n"
-        f"5️⃣ Отправьте боту <code>@юзернейм_канала</code> или его ID.\n\n"
-        f"<i>Бот проверит права, создаст живой виджет и будет обновлять его в канале!</i>"
+    text = (
+        f"📢 <b>КАК ПОДКЛЮЧИТЬ ТАЙМЕР К ВАШЕМУ КАНАЛУ:</b>\n\n"
+        f"1️⃣ Откройте настройки канала в Telegram.\n"
+        f"2️⃣ Добавьте этого бота в список <b>Администраторов</b>.\n"
+        f"3️⃣ Включите права: <b>Публикация</b> и <b>Редактирование сообщений</b>.\n"
+        f"4️⃣ В боте выберите <b>«В Telegram-канал»</b> и просто <b>перешлите любой пост</b> из канала либо отправьте <code>@username</code> канала."
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="⏱ Начать создание", callback_data="start_fsm_wizard")],
-            [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main_menu")]
+            [InlineKeyboardButton(text="⚡ Создать таймер", callback_data="wizard_start")],
+            [InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main_menu")],
         ]
     )
-    await callback.message.edit_text(help_text, reply_markup=kb)
+    await callback.message.edit_text(text, reply_markup=kb)
 
 @router.callback_query(F.data == "back_to_main_menu")
-async def back_to_menu_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    """Возврат на главный экран."""
+async def back_to_main_menu(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.clear()
-    welcome_text = (
-        f"✨ <b>ГЛАВНОЕ МЕНЮ ОБРАТНОГО ОТСЧЕТА</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Выберите действие для продолжения:"
-    )
-    await callback.message.edit_text(welcome_text, reply_markup=get_main_menu_keyboard())
+    await callback.message.edit_text("Главное меню управления таймерами:", reply_markup=get_main_menu_keyboard())
 
-@router.callback_query(F.data == "start_fsm_wizard")
+@router.callback_query(F.data == "my_active_timers")
+@router.message(Command("timers"))
+async def show_active_timers(event: Union[Message, CallbackQuery]) -> None:
+    user_id = event.from_user.id
+    user_timers = [
+        (k, v) for k, v in active_timers_registry.items()
+        if v.get("creator_id") == user_id
+    ]
+
+    if not user_timers:
+        text = "📭 У вас нет активных запущенных таймеров."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Создать таймер", callback_data="wizard_start")],
+                [InlineKeyboardButton(text="◀️ В меню", callback_data="back_to_main_menu")],
+            ]
+        )
+    else:
+        text = f"📋 <b>Ваши активные таймеры ({len(user_timers)}):</b>\n\n"
+        buttons = []
+        tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
+        now = datetime.now(tz)
+
+        for key, info in user_timers:
+            target_dt: datetime = info["target_dt"]
+            title: str = info["title"]
+            rem_sec = max(0, int((target_dt - now).total_seconds()))
+            badge = format_countdown_badge(rem_sec)
+
+            text += (
+                f"• <b>{html.escape(title)}</b>\n"
+                f"  Цель: <code>{target_dt.strftime('%d.%m %H:%M')} МСК</code> | ⏳ <code>{badge}</code>\n"
+            )
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"🛑 Остановить: {title[:20]}",
+                    callback_data=f"stop_timer:{key}"
+                )
+            ])
+        buttons.append([InlineKeyboardButton(text="◀️ В главное меню", callback_data="back_to_main_menu")])
+        kb = InlineKeyboardMarkup(inline_keyboard=buttons)
+
+    if isinstance(event, CallbackQuery):
+        await event.answer()
+        await event.message.edit_text(text, reply_markup=kb)
+    else:
+        await event.answer(text, reply_markup=kb)
+
+@router.callback_query(F.data == "wizard_start")
 @router.message(Command("newtimer"))
-async def start_fsm_wizard_handler(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
-    """Старт FSM-мастера создания таймера."""
+async def wizard_step_1_title(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
     await state.set_state(CountdownFSM.waiting_title)
-    step1_text = (
-        f"📝 <b>[▰▱▱▱▱] Шаг 1 из 5 • Название события</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Введите название вашего события.\n\n"
-        f"<i>💡 Примеры:\n"
-        f"• «Новый Год 2027 🍾»\n"
-        f"• «Гранд-Открытие Сервера 🚀»\n"
-        f"• «До Дня Рождения Кати 🎂»</i>\n\n"
-        f"Отправьте текст в ответном сообщении или /cancel для отмены."
+    text = (
+        f"📝 <b>[●○○○○○] Шаг 1 из 6 • Название события</b>\n\n"
+        f"Введите название для карточки таймера (до 70 символов):\n"
+        f"<i>Например: «Новый Год 2027 🍾» или «Запуск Проекта 🚀»</i>"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")]]
     )
     if isinstance(event, CallbackQuery):
         await event.answer()
-        await event.message.edit_text(step1_text)
+        await event.message.edit_text(text, reply_markup=kb)
     else:
-        await event.answer(step1_text)
+        await event.answer(text, reply_markup=kb)
+
+@router.callback_query(F.data == "wizard_back_to_title")
+async def back_to_title(callback: CallbackQuery, state: FSMContext) -> None:
+    await wizard_step_1_title(callback, state)
 
 @router.message(StateFilter(CountdownFSM.waiting_title), F.text)
-async def process_title_step(message: Message, state: FSMContext) -> None:
-    """Обработка названия события."""
+async def process_title(message: Message, state: FSMContext) -> None:
     title = message.text.strip()
-    if len(title) > 80:
-        await message.answer("⚠️ Название слишком длинное. Пожалуйста, сократите его до 80 символов:")
+    if len(title) > 70:
+        await message.answer("⚠️ Название слишком длинное. Введите текст до 70 символов:")
         return
 
     await state.update_data(title=title)
     await state.set_state(CountdownFSM.waiting_datetime)
 
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
-    sample_dt = (datetime.now(tz) + timedelta(days=2, hours=4)).strftime("%d.%m.%Y %H:%M")
+    sample_time = (datetime.now(tz) + timedelta(days=1, hours=3)).strftime("%d.%m.%Y %H:%M")
 
-    step2_text = (
-        f"📅 <b>[▰▰▱▱▱] Шаг 2 из 5 • Дата и время финиша</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    text = (
+        f"📅 <b>[●●○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
         f"Событие: <b>{html.escape(title)}</b>\n\n"
-        f"Введите дату и время по московскому времени (МСК) строго в формате:\n"
-        f"<code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n\n"
-        f"<i>💡 Пример ввода:</i> <code>{sample_dt}</code>"
+        f"Выберите быстрый интервал кнопкой или введите время вручную:\n"
+        f"• <code>{sample_time}</code> (ДД.ММ.ГГГГ ЧЧ:ММ)\n"
+        f"• <code>20:30</code> (сегодня/завтра)\n"
+        f"• <code>+45m</code>, <code>+2h</code> или <code>+3d</code>"
     )
-    await message.answer(step2_text)
+    await message.answer(text, reply_markup=get_datetime_presets_keyboard())
+
+@router.callback_query(StateFilter(CountdownFSM.waiting_datetime), F.data.startswith("dt_preset:"))
+async def process_datetime_preset(callback: CallbackQuery, state: FSMContext) -> None:
+    preset = callback.data.split(":")[1]
+    tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
+    now = datetime.now(tz)
+
+    delta_map = {
+        "5m": timedelta(minutes=5),
+        "15m": timedelta(minutes=15),
+        "30m": timedelta(minutes=30),
+        "1h": timedelta(hours=1),
+        "3h": timedelta(hours=3),
+        "12h": timedelta(hours=12),
+        "1d": timedelta(days=1),
+        "3d": timedelta(days=3),
+        "7d": timedelta(days=7),
+    }
+
+    target_dt = now + delta_map.get(preset, timedelta(hours=1))
+    diff_sec = (target_dt - now).total_seconds()
+
+    await state.update_data(target_dt_iso=target_dt.isoformat(), total_seconds=diff_sec, style_key="classic")
+    await state.set_state(CountdownFSM.waiting_style)
+    await callback.answer("Время выбрано!")
+
+    await callback.message.edit_text(
+        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"Финиш: <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n\n"
+        f"Выберите понравившийся вид полосы прогресса:",
+        reply_markup=get_style_selection_keyboard("classic")
+    )
 
 @router.message(StateFilter(CountdownFSM.waiting_datetime), F.text)
-async def process_datetime_step(message: Message, state: FSMContext) -> None:
-    """Валидация введенной даты и времени."""
-    text = message.text.strip()
+async def process_datetime_text(message: Message, state: FSMContext) -> None:
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
+    target_dt = parse_flexible_datetime(message.text, tz)
 
-    try:
-        naive_dt = datetime.strptime(text, "%d.%m.%Y %H:%M")
-        target_dt = tz.localize(naive_dt)
-    except ValueError:
+    if not target_dt:
         await message.answer(
-            f"❌ <b>Неверный формат даты!</b>\n\n"
-            f"Пожалуйста, соблюдайте шаблон: <code>ДД.ММ.ГГГГ ЧЧ:ММ</code>\n"
-            f"<i>Например:</i> <code>31.12.2026 23:59</code>"
+            "❌ <b>Не распознано время!</b>\nПопробуйте формат <code>ДД.ММ.ГГГГ ЧЧ:ММ</code> или выберите кнопку:",
+            reply_markup=get_datetime_presets_keyboard()
         )
         return
 
     now = datetime.now(tz)
     diff_sec = (target_dt - now).total_seconds()
-    if diff_sec <= 20:
-        await message.answer(
-            f"⚠️ <b>Время события должно быть в будущем!</b>\n"
-            f"Укажите время хотя бы на 20 секунд позже текущего момента."
-        )
+    if diff_sec <= 10:
+        await message.answer("⚠️ Дата события должна быть в будущем (хотя бы на 10 секунд вперед)!")
         return
 
-    await state.update_data(
-        target_dt_iso=target_dt.isoformat(),
-        total_seconds=diff_sec,
-    )
-    await state.set_state(CountdownFSM.waiting_destination)
+    await state.update_data(target_dt_iso=target_dt.isoformat(), total_seconds=diff_sec, style_key="classic")
+    await state.set_state(CountdownFSM.waiting_style)
 
-    step3_text = (
-        f"📍 <b>[▰▰▰▱▱] Шаг 3 из 5 • Место публикации</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Где именно запустить живой таймер?"
+    await message.answer(
+        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"Финиш: <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n\n"
+        f"Выберите стиль шкалы прогресса:",
+        reply_markup=get_style_selection_keyboard("classic")
     )
-    await message.answer(step3_text, reply_markup=get_destination_keyboard())
+
+@router.callback_query(F.data == "wizard_back_to_datetime")
+async def back_to_datetime(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    title = data.get("title", "Событие")
+    await state.set_state(CountdownFSM.waiting_datetime)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"📅 <b>[●●○○○○] Шаг 2 из 6 • Время финиша</b>\n\n"
+        f"Событие: <b>{html.escape(title)}</b>\n"
+        f"Выберите кнопку или отправьте дату:",
+        reply_markup=get_datetime_presets_keyboard()
+    )
+
+@router.callback_query(StateFilter(CountdownFSM.waiting_style), F.data.startswith("set_style:"))
+async def choose_style_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    style_key = callback.data.split(":")[1]
+    await state.update_data(style_key=style_key)
+    await callback.answer("Стиль обновлен!")
+    await callback.message.edit_reply_markup(reply_markup=get_style_selection_keyboard(style_key))
+
+@router.callback_query(StateFilter(CountdownFSM.waiting_style), F.data == "wizard_continue_from_style")
+async def continue_from_style_handler(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.set_state(CountdownFSM.waiting_destination)
+    await callback.message.edit_text(
+        f"📍 <b>[●●●●○○] Шаг 4 из 6 • Место публикации</b>\n\n"
+        f"Куда вы хотите отправить живой виджет таймера?",
+        reply_markup=get_destination_keyboard()
+    )
+
+@router.callback_query(F.data == "wizard_back_to_style")
+async def back_to_style(callback: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    current_style = data.get("style_key", "classic")
+    await state.set_state(CountdownFSM.waiting_style)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🎨 <b>[●●●○○○] Шаг 3 из 6 • Стиль шкалы прогресса</b>\n\n"
+        f"Выберите стиль шкалы прогресса:",
+        reply_markup=get_style_selection_keyboard(current_style)
+    )
 
 @router.callback_query(CountdownFSM.waiting_destination, F.data == "dest_private")
-async def choose_dest_private_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    """Выбор публикации в ЛС."""
+async def choose_dest_private(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
-    await state.update_data(target_chat_id=callback.message.chat.id)
+    await state.update_data(target_chat_id=callback.message.chat.id, target_chat_name="Этот диалог (ЛС)")
     await state.set_state(CountdownFSM.waiting_photo)
-
-    step4_text = (
-        f"🖼 <b>[▰▰▰▰▱] Шаг 4 из 5 • Обложка / Баннер</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Отправьте фотографию для создания красивой карточки события.\n\n"
-        f"<i>Если фото не требуется, нажмите кнопку ниже:</i>"
+    await callback.message.edit_text(
+        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n\n"
+        f"Отправьте фотографию для карточки события или нажмите «Без обложки»:",
+        reply_markup=get_photo_step_keyboard()
     )
-    await callback.message.edit_text(step4_text, reply_markup=get_skip_photo_keyboard())
 
 @router.callback_query(CountdownFSM.waiting_destination, F.data == "dest_channel")
-async def choose_dest_channel_handler(callback: CallbackQuery, state: FSMContext) -> None:
-    """Выбор публикации в Telegram-канал."""
+async def choose_dest_channel(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
     await state.set_state(CountdownFSM.waiting_channel_target)
-
-    prompt_channel = (
-        f"📢 <b>[▰▰▰▱▱] Привязка Telegram-канала</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"1. Добавьте бота в канал как <b>Администратора</b>.\n"
-        f"2. Предоставьте права: <b>Публикация</b> и <b>Редактирование</b>.\n"
-        f"3. Отправьте сюда <code>@юзернейм_канала</code> или его цифровой <code>ID</code> "
-        f"(например, <code>-1001234567890</code>):"
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="« Назад", callback_data="wizard_back_to_style")],
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_wizard")],
+        ]
     )
-    await callback.message.edit_text(prompt_channel)
+    await callback.message.edit_text(
+        f"📢 <b>Привязка канала:</b>\n\n"
+        f"1. Добавьте бота в канал администратором (права на публикацию и редактирование).\n"
+        f"2. <b>Перешлите сюда любой пост из канала</b> или введите <code>@username</code> / цифровой ID:",
+        reply_markup=kb
+    )
 
-@router.message(StateFilter(CountdownFSM.waiting_channel_target), F.text)
-async def process_channel_input_step(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Проверка прав бота в указанном канале."""
-    raw_channel = message.text.strip()
-    target_chat_spec: Union[int, str] = int(raw_channel) if (raw_channel.startswith("-") and raw_channel[1:].isdigit()) else raw_channel
+@router.callback_query(F.data == "wizard_back_to_dest")
+async def back_to_dest(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(CountdownFSM.waiting_destination)
+    await callback.answer()
+    await callback.message.edit_text(
+        "📍 <b>[●●●●○○] Шаг 4 из 6 • Место публикации</b>\nКуда отправить живой таймер?",
+        reply_markup=get_destination_keyboard()
+    )
+
+@router.message(StateFilter(CountdownFSM.waiting_channel_target))
+async def process_channel_target(message: Message, state: FSMContext, bot: Bot) -> None:
+    chat_identifier: Union[int, str]
+
+    if message.forward_from_chat:
+        chat_identifier = message.forward_from_chat.id
+    else:
+        raw_text = (message.text or "").strip()
+        if not raw_text:
+            await message.answer("Пожалуйста, отправьте @юзернейм, ID или перешлите пост из канала.")
+            return
+        chat_identifier = int(raw_text) if (raw_text.startswith("-") and raw_text[1:].isdigit()) else raw_text
 
     try:
-        chat = await bot.get_chat(target_chat_spec)
+        chat = await bot.get_chat(chat_identifier)
         member = await bot.get_chat_member(chat.id, bot.id)
 
         if member.status not in ("administrator", "creator"):
-            await message.answer(
-                f"❌ <b>Бот не является администратором в канале «{chat.title}»!</b>\n\n"
-                f"Назначьте бота администратором и повторите отправку юзернейма/ID."
-            )
+            await message.answer(f"❌ Бот не является администратором в канале «{chat.title}». Назначьте права и попробуйте снова:")
             return
 
         if hasattr(member, "can_post_messages") and not member.can_post_messages:
-            await message.answer(
-                f"⚠️ У бота нет права <b>публиковать посты</b> в канале «{chat.title}».\n"
-                f"Выдайте соответствующее право в настройках прав администратора."
-            )
-            return
-
-        if hasattr(member, "can_edit_messages") and not member.can_edit_messages:
-            await message.answer(
-                f"⚠️ У бота нет права <b>редактировать чужие посты</b> в канале «{chat.title}».\n"
-                f"Включите право «Редактирование сообщений»."
-            )
+            await message.answer(f"⚠️ У бота нет права <b>публиковать посты</b> в «{chat.title}».")
             return
 
         target_chat_id = chat.id
-        channel_title = chat.title
+        target_title = chat.title
 
     except Exception as exc:
-        await message.answer(
-            f"❌ <b>Не удалось подключиться к каналу:</b>\n"
-            f"<code>{html.escape(str(exc))}</code>\n\n"
-            f"Убедитесь, что бот уже добавлен в канал и юзернейм указан верно."
-        )
+        await message.answer(f"❌ Ошибка проверки канала: <code>{html.escape(str(exc))}</code>\nУбедитесь, что бот уже добавлен.")
         return
 
-    await state.update_data(target_chat_id=target_chat_id)
+    await state.update_data(target_chat_id=target_chat_id, target_chat_name=f"Канал «{target_title}»")
     await state.set_state(CountdownFSM.waiting_photo)
 
-    step4_text = (
-        f"✅ <b>Канал «{html.escape(channel_title)}» успешно подключен!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"🖼 <b>[▰▰▰▰▱] Шаг 4 из 5 • Обложка / Баннер</b>\n\n"
-        f"Отправьте фотографию для поста в канал или нажмите кнопку <b>«⏩ Без обложки»</b>:"
+    await message.answer(
+        f"✅ Канал <b>«{html.escape(target_title)}»</b> успешно подключен!\n\n"
+        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
+        f"Отправьте фотографию или пропустите шаг:",
+        reply_markup=get_photo_step_keyboard()
     )
-    await message.answer(step4_text, reply_markup=get_skip_photo_keyboard())
 
 @router.message(StateFilter(CountdownFSM.waiting_photo), F.photo)
-async def process_photo_received(message: Message, state: FSMContext) -> None:
-    """Пользователь загрузил изображение."""
+async def process_photo_upload(message: Message, state: FSMContext) -> None:
     photo_file_id = message.photo[-1].file_id
     await state.update_data(photo_id=photo_file_id)
     await state.set_state(CountdownFSM.waiting_finish_text)
-
-    step5_text = (
-        f"🎉 <b>[▰▰▰▰▰] Шаг 5 из 5 • Финальное послание</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Введите текст, который появится в момент <code>00:00:00</code>:\n\n"
-        f"<i>💡 Пример: «Ура! С Новым Годом! 🍾 Настало время открывать шампанское!»</i>"
+    await message.answer(
+        f"🖼 Обложка сохранена!\n\n"
+        f"🎉 <b>[●●●●●●] Шаг 6 из 6 • Финальное послание</b>\n"
+        f"Введите текст, который появится в карточке и уведомлении при 00:00:00:",
+        reply_markup=get_finish_text_keyboard()
     )
-    await message.answer(step5_text)
 
 @router.callback_query(CountdownFSM.waiting_photo, F.data == "skip_photo_action")
 async def process_photo_skipped(callback: CallbackQuery, state: FSMContext) -> None:
-    """Пользователь пропустил фото."""
     await callback.answer()
     await state.update_data(photo_id=None)
     await state.set_state(CountdownFSM.waiting_finish_text)
-
-    step5_text = (
-        f"🎉 <b>[▰▰▰▰▰] Шаг 5 из 5 • Финальное послание</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"Введите текст, который появится в момент <code>00:00:00</code>:\n\n"
-        f"<i>💡 Пример: «Время пришло! Релиз успешно состоялся!»</i>"
+    await callback.message.edit_text(
+        f"🎉 <b>[●●●●●●] Шаг 6 из 6 • Финальное послание</b>\n\n"
+        f"Введите текст поздравления/завершения или нажмите кнопку по умолчанию:",
+        reply_markup=get_finish_text_keyboard()
     )
-    await callback.message.edit_text(step5_text)
+
+@router.callback_query(F.data == "wizard_back_to_photo")
+async def back_to_photo(callback: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(CountdownFSM.waiting_photo)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🖼 <b>[●●●●●○] Шаг 5 из 6 • Обложка / Баннер</b>\n"
+        f"Отправьте фото или продолжите без него:",
+        reply_markup=get_photo_step_keyboard()
+    )
+
+@router.callback_query(CountdownFSM.waiting_finish_text, F.data == "default_finish_text")
+async def finish_text_default(callback: CallbackQuery, state: FSMContext) -> None:
+    await callback.answer()
+    await state.update_data(finish_text="Событие наступило! Поздравляем! 🎉")
+    await show_confirmation_preview(callback, state)
 
 @router.message(StateFilter(CountdownFSM.waiting_finish_text), F.text)
-async def process_finish_text_step(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Получение финального сообщения и запуск живого виджета."""
-    finish_text = message.text.strip()
+async def finish_text_custom(message: Message, state: FSMContext) -> None:
+    await state.update_data(finish_text=message.text.strip())
+    await show_confirmation_preview(message, state)
+
+async def show_confirmation_preview(event: Union[Message, CallbackQuery], state: FSMContext) -> None:
+    await state.set_state(CountdownFSM.waiting_confirm)
+    data = await state.get_data()
+
+    title = data["title"]
+    target_dt = datetime.fromisoformat(data["target_dt_iso"])
+    style_key = data.get("style_key", "classic")
+    dest_name = data.get("target_chat_name", "Диалог")
+    has_photo = bool(data.get("photo_id"))
+    finish_text = data.get("finish_text", "Событие наступило!")
+
+    sample_bar, _ = generate_progress_bar(100, 75, length=10, style_key=style_key)
+
+    preview_text = (
+        f"🔍 <b>ПРЕДПРОСМОТР ТАЙМЕРА ПЕРЕД СТАРТОМ</b>\n"
+        f"─────────────────────────────\n"
+        f"📌 <b>Событие:</b> {html.escape(title)}\n"
+        f"🎯 <b>Цель:</b> <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n"
+        f"📊 <b>Вид шкалы:</b> <code>[{sample_bar}] 25%</code>\n"
+        f"📍 <b>Куда:</b> {html.escape(dest_name)}\n"
+        f"🖼 <b>Обложка:</b> {'Прикреплена' if has_photo else 'Без фото'}\n"
+        f"💬 <b>Финал:</b> <i>«{html.escape(finish_text)}»</i>\n"
+        f"─────────────────────────────\n"
+        f"⚡ <i>Отсчет будет идти непрерывно каждые {int(LIVE_UPDATE_INTERVAL_SECONDS)} секунды.</i>"
+    )
+
+    if isinstance(event, CallbackQuery):
+        await event.message.edit_text(preview_text, reply_markup=get_confirmation_keyboard())
+    else:
+        await event.answer(preview_text, reply_markup=get_confirmation_keyboard())
+
+@router.callback_query(CountdownFSM.waiting_confirm, F.data == "confirm_launch_timer")
+async def confirm_launch_timer(callback: CallbackQuery, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     await state.clear()
+    await callback.answer("Запускаем живой отсчет...")
 
     title: str = data["title"]
     target_dt = datetime.fromisoformat(data["target_dt_iso"])
     target_chat_id: Union[int, str] = data["target_chat_id"]
+    style_key: str = data.get("style_key", "classic")
     photo_id: Optional[str] = data.get("photo_id")
+    finish_text: str = data.get("finish_text", "Событие наступило!")
 
     tz = pytz.timezone(DEFAULT_TIMEZONE_STR)
     now = datetime.now(tz)
@@ -651,119 +899,139 @@ async def process_finish_text_step(message: Message, state: FSMContext, bot: Bot
         target_dt=target_dt,
         total_seconds=total_seconds,
         remaining_seconds=total_seconds,
+        style_key=style_key,
         is_finished=False,
     )
 
-    is_private_chat = (str(target_chat_id) == str(message.chat.id))
-    kb = get_timer_widget_keyboard(can_stop=is_private_chat)
+    is_private_chat = (str(target_chat_id) == str(callback.message.chat.id))
 
-    # Публикация первого кадра
+    # Публикация карточки
     try:
         if photo_id:
             sent_msg = await bot.send_photo(
                 chat_id=target_chat_id,
                 photo=photo_id,
                 caption=initial_card,
-                reply_markup=kb,
             )
         else:
             sent_msg = await bot.send_message(
                 chat_id=target_chat_id,
                 text=initial_card,
-                reply_markup=kb,
             )
-    except Exception as send_err:
-        await message.answer(
-            f"❌ <b>Ошибка при отправке в чат/канал:</b>\n"
-            f"<code>{html.escape(str(send_err))}</code>\n\n"
-            f"Убедитесь, что бот имеет достаточные права в указанном чате."
+    except Exception as err:
+        await callback.message.edit_text(
+            f"❌ <b>Ошибка отправки сообщения:</b>\n<code>{html.escape(str(err))}</code>\n\n"
+            f"Убедитесь, что у бота есть права на публикацию.",
+            reply_markup=get_main_menu_keyboard()
         )
         return
 
-    # Запуск фонового асинхронного таска
-    task = asyncio.create_task(
+    timer_key = f"{target_chat_id}_{sent_msg.message_id}"
+
+    # Если в ЛС — сразу ставим кнопку остановки
+    if is_private_chat:
+        try:
+            kb = get_timer_widget_keyboard(timer_key=timer_key, can_stop=True)
+            if photo_id:
+                await bot.edit_message_caption(
+                    chat_id=target_chat_id,
+                    message_id=sent_msg.message_id,
+                    caption=initial_card,
+                    reply_markup=kb,
+                )
+            else:
+                await bot.edit_message_text(
+                    chat_id=target_chat_id,
+                    message_id=sent_msg.message_id,
+                    text=initial_card,
+                    reply_markup=kb,
+                )
+        except Exception:
+            pass
+
+    # Регистрация в реестре
+    active_timers_registry[timer_key] = {
+        "title": title,
+        "target_dt": target_dt,
+        "chat_id": target_chat_id,
+        "msg_id": sent_msg.message_id,
+        "creator_id": callback.from_user.id,
+    }
+
+    # Запуск живого воркера
+    worker_task = asyncio.create_task(
         run_live_timer_worker(
             bot=bot,
+            timer_key=timer_key,
             target_chat_id=target_chat_id,
             message_id=sent_msg.message_id,
             title=title,
             target_dt=target_dt,
             total_seconds=total_seconds,
+            style_key=style_key,
             finish_text=finish_text,
             has_photo=bool(photo_id),
-            creator_user_id=message.from_user.id,
+            creator_user_id=callback.from_user.id,
         ),
-        name=f"timer_{target_chat_id}_{sent_msg.message_id}",
+        name=f"timer_task_{timer_key}",
     )
-    active_tasks.add(task)
-    task.add_done_callback(active_tasks.discard)
+    active_tasks[timer_key] = worker_task
 
-    # Подтверждение пользователю
-    dest_label = "в этот диалог" if is_private_chat else f"в канал (<code>{target_chat_id}</code>)"
-    await message.answer(
-        f"🚀 <b>ТАЙМЕР УСПЕШНО ЗАПУЩЕН!</b>\n"
-        f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
+    await callback.message.edit_text(
+        f"🚀 <b>Таймер успешно запущен!</b>\n\n"
         f"📌 <b>Событие:</b> {html.escape(title)}\n"
-        f"🎯 <b>Финиш:</b> <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} (МСК)</code>\n"
-        f"📍 <b>Место:</b> {dest_label}\n"
-        f"🔄 <b>Обновление:</b> каждые {UPDATE_INTERVAL_SECONDS} секунды.",
+        f"🎯 <b>Цель:</b> <code>{target_dt.strftime('%d.%m.%Y в %H:%M')} МСК</code>\n\n"
+        f"Виджет уже непрерывно обновляется в реальном времени.",
         reply_markup=InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⏱ Создать еще один", callback_data="start_fsm_wizard")]]
+            inline_keyboard=[
+                [InlineKeyboardButton(text="⚡ Создать еще один", callback_data="wizard_start")],
+                [InlineKeyboardButton(text="📋 Мои активные таймеры", callback_data="my_active_timers")],
+            ]
         )
     )
 
-@router.callback_query(F.data == "stop_active_timer")
-async def stop_active_timer_handler(callback: CallbackQuery) -> None:
-    """Ручная остановка таймера в ЛС."""
-    chat_id = callback.message.chat.id
-    msg_id = callback.message.message_id
+@router.callback_query(F.data.startswith("stop_timer:"))
+async def stop_timer_handler(callback: CallbackQuery, bot: Bot) -> None:
+    timer_key = callback.data.split(":", 1)[1]
+    timer_info = active_timers_registry.get(timer_key)
 
-    stopped = False
-    for task in list(active_tasks):
-        if task.get_name() == f"timer_{chat_id}_{msg_id}":
-            task.cancel()
-            stopped = True
-            break
+    task = active_tasks.get(timer_key)
+    if task:
+        task.cancel()
 
-    try:
+    if timer_info:
+        chat_id = timer_info["chat_id"]
+        msg_id = timer_info["msg_id"]
+        try:
+            await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=None)
+        except Exception:
+            pass
+
+    active_tasks.pop(timer_key, None)
+    active_timers_registry.pop(timer_key, None)
+
+    await callback.answer("🛑 Отсчет остановлен.", show_alert=True)
+    if callback.message:
         await callback.message.edit_reply_markup(reply_markup=None)
-    except Exception:
-        pass
-
-    if stopped:
-        await callback.answer("🛑 Отсчет остановлен.", show_alert=True)
-        await callback.message.reply("⏹ Этот таймер был остановлен создателем.")
-    else:
-        await callback.answer("Этот таймер уже завершен или неактивен.", show_alert=False)
 
 async def on_startup(bot: Bot) -> None:
-    """Оповещение администратора при запуске."""
-    logger.info("Бот обратного отсчета успешно стартовал!")
-    try:
-        await bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                f"🚀 <b>БОТ ОБРАТНОГО ОТСЧЕТА ЗАПУЩЕН</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━\n"
-                f"✅ Автоустановка зависимостей отработала штатно.\n"
-                f"⚡ Готов к работе в ЛС и Telegram-каналах!"
-            ),
-        )
-    except Exception as exc:
-        logger.warning(f"Не удалось отправить уведомление админу {ADMIN_ID}: {exc}")
+    logger.info("Бот обратного отсчета запущен!")
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Главное меню"),
+        BotCommand(command="newtimer", description="Создать таймер"),
+        BotCommand(command="timers", description="Активные таймеры"),
+        BotCommand(command="cancel", description="Отменить создание"),
+    ])
 
 async def on_shutdown(bot: Bot) -> None:
-    """Корректная остановка всех тасков."""
-    logger.info("Остановка бота... Отмена активных воркеров.")
-    for task in list(active_tasks):
+    logger.info("Остановка бота... Отмена активных задач.")
+    for task in active_tasks.values():
         task.cancel()
     if active_tasks:
-        await asyncio.gather(*active_tasks, return_exceptions=True)
+        await asyncio.gather(*active_tasks.values(), return_exceptions=True)
     await bot.session.close()
-    logger.info("Бот полностью выключен.")
 
 async def main() -> None:
-    """Главная точка входа приложения."""
     bot = Bot(
         token=BOT_TOKEN,
         default=DefaultBotProperties(parse_mode=ParseMode.HTML),
@@ -781,4 +1049,4 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except (KeyboardInterrupt, SystemExit):
-        logger.info("Бот выключен пользователем.")
+        logger.info("Бот выключен.")
